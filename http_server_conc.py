@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""
+Concurrent HTTP Server - Homework 4
+Modified from HW3 to support concurrent connections with connection limits.
+
+Features:
+- Handles multiple client connections concurrently using threads
+- Enforces per-client connection limit (-maxclient)
+- Enforces system-wide total connection limit (-maxtotal)
+- Serves static files with proper MIME types
+- Handles 404 errors gracefully
+
+Author: Hugo Padilla - Server implementation
+TODO for Teammate 1: Test server with your HTTP client implementation
+TODO for Teammate 2: Run Part 2 performance tests and document results
+"""
+
+import socket
+import threading
+import os
+import mimetypes
+import argparse
+import sys
+from collections import defaultdict
+from typing import Tuple, Dict
+
+# Global connection tracking (thread-safe with locks)
+active_connections = 0
+connection_lock = threading.Lock()
+client_connections: Dict[str, int] = defaultdict(int)
+client_lock = threading.Lock()
+
+
+def parse_http_request(request_data: bytes) -> str:
+    """
+    Parse HTTP request and extract the file path.
+    
+    Args:
+        request_data: Raw HTTP request bytes
+        
+    Returns:
+        File path to serve (sanitized)
+    """
+    try:
+        request_str = request_data.decode('utf-8')
+        lines = request_str.split('\n')
+        
+        if not lines:
+            return None
+            
+        # Extract GET request line
+        request_line = lines[0].strip()
+        if not request_line.startswith('GET'):
+            return None
+            
+        # Parse path from GET request
+        parts = request_line.split()
+        if len(parts) < 2:
+            return None
+            
+        path = parts[1]
+        
+        # Remove query string if present
+        if '?' in path:
+            path = path.split('?')[0]
+        
+        # Map root to index.html
+        if path == '/':
+            path = '/index.html'
+        
+        # Sanitize path - prevent directory traversal
+        path = path.lstrip('/')
+        path = os.path.normpath(path)
+        
+        # Prevent going above current directory
+        if path.startswith('..'):
+            return None
+            
+        return path
+        
+    except Exception as e:
+        print(f"Error parsing request: {e}")
+        return None
+
+
+def generate_http_response(file_path: str) -> Tuple[bytes, int]:
+    """
+    Generate HTTP response for requested file.
+    
+    Args:
+        file_path: Path to the file to serve
+        
+    Returns:
+        Tuple of (response_bytes, status_code)
+    """
+    if not file_path or not os.path.exists(file_path):
+        # 404 Not Found
+        error_html = b"""<!DOCTYPE html>
+<html>
+<head><title>404 Not Found</title></head>
+<body>
+<h1>404 Not Found</h1>
+<p>The requested resource was not found on this server.</p>
+</body>
+</html>"""
+        
+        response = f"HTTP/1.1 404 Not Found\r\n"
+        response += "Content-Type: text/html\r\n"
+        response += f"Content-Length: {len(error_html)}\r\n"
+        response += "Connection: close\r\n"
+        response += "\r\n"
+        
+        return (response.encode('utf-8') + error_html, 404)
+    
+    # File exists - serve it
+    try:
+        with open(file_path, 'rb') as f:
+            file_content = f.read()
+        
+        # Determine MIME type
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if not mime_type:
+            mime_type = 'application/octet-stream'
+        
+        # Generate successful response
+        response = "HTTP/1.1 200 OK\r\n"
+        response += f"Content-Type: {mime_type}\r\n"
+        response += f"Content-Length: {len(file_content)}\r\n"
+        response += "Connection: close\r\n"
+        response += "\r\n"
+        
+        return (response.encode('utf-8') + file_content, 200)
+        
+    except Exception as e:
+        print(f"Error reading file {file_path}: {e}")
+        # Return 500 error
+        error_html = b"""<!DOCTYPE html>
+<html>
+<head><title>500 Internal Server Error</title></head>
+<body>
+<h1>500 Internal Server Error</h1>
+<p>An error occurred while processing your request.</p>
+</body>
+</html>"""
+        
+        response = f"HTTP/1.1 500 Internal Server Error\r\n"
+        response += "Content-Type: text/html\r\n"
+        response += f"Content-Length: {len(error_html)}\r\n"
+        response += "Connection: close\r\n"
+        response += "\r\n"
+        
+        return (response.encode('utf-8') + error_html, 500)
+
+
+def get_client_id(client_address: Tuple[str, int]) -> str:
+    """
+    Generate a unique client identifier.
+    Uses IP address and port to identify unique client connections.
+    
+    Note: For a more robust implementation, you might want to consider
+    using additional factors like User-Agent or session tokens, but
+    IP:port is sufficient for this assignment.
+    
+    Args:
+        client_address: Tuple of (host, port)
+        
+    Returns:
+        Client identifier string
+    """
+    return f"{client_address[0]}:{client_address[1]}"
+
+
+def can_accept_connection(client_address: Tuple[str, int], 
+                          max_client: int, 
+                          max_total: int) -> bool:
+    """
+    Check if we can accept a new connection based on limits.
+    
+    Args:
+        client_address: Client address tuple
+        max_client: Maximum connections per client
+        max_total: Maximum total connections
+        
+    Returns:
+        True if connection can be accepted, False otherwise
+    """
+    global active_connections
+    client_id = get_client_id(client_address)
+    
+    with connection_lock:
+        # Check system-wide limit
+        if active_connections >= max_total:
+            return False
+    
+    with client_lock:
+        # Check per-client limit
+        if client_connections[client_id] >= max_client:
+            return False
+    
+    return True
+
+
+def increment_connection_count(client_address: Tuple[str, int]):
+    """Increment connection counts for system and client."""
+    global active_connections
+    client_id = get_client_id(client_address)
+    
+    with connection_lock:
+        active_connections += 1
+    
+    with client_lock:
+        client_connections[client_id] += 1
+
+
+def decrement_connection_count(client_address: Tuple[str, int]):
+    """Decrement connection counts for system and client."""
+    global active_connections
+    client_id = get_client_id(client_address)
+    
+    with connection_lock:
+        active_connections -= 1
+        if active_connections < 0:
+            active_connections = 0
+    
+    with client_lock:
+        client_connections[client_id] -= 1
+        if client_connections[client_id] <= 0:
+            del client_connections[client_id]
+
+
+def handle_client(client_socket: socket.socket, 
+                  client_address: Tuple[str, int],
+                  max_client: int,
+                  max_total: int):
+    """
+    Handle a single client connection.
+    
+    Args:
+        client_socket: Socket for client connection
+        client_address: Client address tuple
+        max_client: Maximum connections per client
+        max_total: Maximum total connections
+    """
+    try:
+        # Check if we can accept this connection
+        if not can_accept_connection(client_address, max_client, max_total):
+            # Send 503 Service Unavailable
+            error_response = "HTTP/1.1 503 Service Unavailable\r\n"
+            error_response += "Content-Type: text/plain\r\n"
+            error_response += "Connection: close\r\n"
+            error_response += "\r\n"
+            error_response += "Connection limit exceeded. Please try again later.\r\n"
+            client_socket.sendall(error_response.encode('utf-8'))
+            client_socket.close()
+            return
+        
+        # Increment connection counters
+        increment_connection_count(client_address)
+        
+        try:
+            # Receive request
+            request_data = client_socket.recv(4096)
+            if not request_data:
+                return
+            
+            # Parse request
+            file_path = parse_http_request(request_data)
+            
+            # Generate and send response
+            response, status_code = generate_http_response(file_path)
+            client_socket.sendall(response)
+            
+            # Log request (for debugging)
+            print(f"[{threading.current_thread().name}] {client_address[0]}:{client_address[1]} - {file_path or 'invalid'} - {status_code}")
+            
+        finally:
+            # Always decrement counters and close socket
+            decrement_connection_count(client_address)
+            client_socket.close()
+            
+    except Exception as e:
+        print(f"Error handling client {client_address}: {e}")
+        try:
+            client_socket.close()
+        except:
+            pass
+        finally:
+            decrement_connection_count(client_address)
+
+
+def run_server(port: int, max_client: int, max_total: int):
+    """
+    Run the concurrent HTTP server.
+    
+    Args:
+        port: Port number to listen on
+        max_client: Maximum connections per client
+        max_total: Maximum total connections
+    """
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    try:
+        server_socket.bind(('', port))
+        server_socket.listen(5)
+        print(f"Concurrent HTTP Server listening on port {port}")
+        print(f"Max connections per client: {max_client}")
+        print(f"Max total connections: {max_total}")
+        print(f"Server started. Press Ctrl+C to stop.")
+        
+        while True:
+            try:
+                client_socket, client_address = server_socket.accept()
+                
+                # Create a new thread for each client
+                client_thread = threading.Thread(
+                    target=handle_client,
+                    args=(client_socket, client_address, max_client, max_total),
+                    daemon=True
+                )
+                client_thread.start()
+                
+            except KeyboardInterrupt:
+                print("\nShutting down server...")
+                break
+            except Exception as e:
+                print(f"Error accepting connection: {e}")
+                continue
+                
+    except Exception as e:
+        print(f"Error starting server: {e}")
+        sys.exit(1)
+    finally:
+        server_socket.close()
+        print("Server stopped.")
+
+
+def main():
+    """Main entry point with command-line argument parsing."""
+    parser = argparse.ArgumentParser(
+        description='Concurrent HTTP Server with connection limits',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s -p 20001 -maxclient 12 -maxtotal 60
+  %(prog)s -p 8080 -maxclient 10 -maxtotal 50
+        """
+    )
+    
+    parser.add_argument('-p', '--port', type=int, default=8080,
+                       help='Port number to listen on (default: 8080)')
+    parser.add_argument('-maxclient', type=int, required=True,
+                       help='Maximum number of connections per client (required)')
+    parser.add_argument('-maxtotal', type=int, required=True,
+                       help='Maximum total number of connections (required)')
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.port < 1 or args.port > 65535:
+        print("Error: Port must be between 1 and 65535", file=sys.stderr)
+        sys.exit(1)
+    
+    if args.maxclient < 1:
+        print("Error: -maxclient must be at least 1", file=sys.stderr)
+        sys.exit(1)
+    
+    if args.maxtotal < 1:
+        print("Error: -maxtotal must be at least 1", file=sys.stderr)
+        sys.exit(1)
+    
+    if args.maxtotal < args.maxclient:
+        print("Warning: -maxtotal should be >= -maxclient", file=sys.stderr)
+    
+    # Run the server
+    run_server(args.port, args.maxclient, args.maxtotal)
+
+
+if __name__ == '__main__':
+    main()
+
